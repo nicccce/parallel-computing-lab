@@ -208,11 +208,23 @@ int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
                   << " <fasta_file> <threshold>" << std::endl;
+        std::cerr << "Alternative Usage: " << argv[0]
+                  << " <number_of_threads> <fasta_file> <threshold>" << std::endl;
         return 1;
     }
 
-    const std::string filename = argv[1];
-    const double threshold = std::stod(argv[2]);
+    std::string filename;
+    double threshold = 0.0;
+
+    if (argc == 3) {
+        filename = argv[1];
+        threshold = std::stod(argv[2]);
+    } else {
+        int num_threads = std::stoi(argv[1]);
+        filename = argv[2];
+        threshold = std::stod(argv[3]);
+        omp_set_num_threads(num_threads);
+    }
 
     init_aa_map();
     init_hash_family();
