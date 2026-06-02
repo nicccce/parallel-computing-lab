@@ -41,7 +41,7 @@ for t in 1 2 4 8 16 32 64; do
     
     for ((r=1; r<=RUNS; r++)); do
         # Run and extract real time
-        elapsed=$( { time -p $EXE $FASTA $THRESHOLD > /dev/null; } 2>&1 | grep '^real' | awk '{print $2}' )
+        elapsed=$( { time -p $EXE $t $FASTA $THRESHOLD > /dev/null; } 2>&1 | grep '^real' | awk '{print $2}' )
         sum=$(echo "$sum $elapsed" | awk '{print $1 + $2}')
         printf "%-10.2f | " "$elapsed"
     done

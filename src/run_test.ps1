@@ -35,7 +35,7 @@ Write-Host ">>> [3/4] Running tests (Total $Runs runs)..." -ForegroundColor Yell
 for ($i = 1; $i -le $Runs; $i++) {
     Write-Host "  Running test $i ..."
     
-    $runCmd = "cd $RemoteDir && export OMP_NUM_THREADS=$Threads && { time -p ./jaccard_cluster_test test.fasta 0.85 > test_output.txt; } 2>&1 && md5sum test_output.txt && md5sum result1.txt"
+    $runCmd = "cd $RemoteDir && { time -p ./jaccard_cluster_test $Threads test.fasta 0.85 > test_output.txt; } 2>&1 && md5sum test_output.txt && md5sum result1.txt"
     $output = ssh -o StrictHostKeyChecking=no -i $Identity -p $Port $Server $runCmd
     
     $testMd5 = $null
