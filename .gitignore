@@ -1,0 +1,22 @@
+# Ignore generated binaries and object files
+*.o
+*.exe
+*.out
+jaccard_cluster_test
+
+# Ignore archive files
+*.zip
+*.tar.gz
+*.tgz
+
+# Ignore local system/IDE directories
+.vs/
+.vscode/
+.idea/
+cmake-build-*/
+out/
+build/
+
+# Ignore local outputs and temporary files
+*test_output.txt
+*.log
