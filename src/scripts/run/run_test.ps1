@@ -3,6 +3,25 @@ param(
     [int]$Threads = 4
 )
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+$ResultsDir = Join-Path $RepoRoot "results"
+$SourceFile = Join-Path $RepoRoot "wj.cpp"
+$MakefilePath = Join-Path $RepoRoot "Makefile"
+$LogPath = Join-Path $ResultsDir "experiment_result.log"
+
+New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
+
+if (-not (Test-Path -LiteralPath $SourceFile)) {
+    Write-Host "Cannot find wj.cpp at $SourceFile" -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $MakefilePath)) {
+    Write-Host "Cannot find Makefile at $MakefilePath" -ForegroundColor Red
+    exit 1
+}
+
 $Server = "root@211.87.224.231"
 $Port = 8022
 $Identity = "C:\Users\pc23\.ssh\id_ed25519"
@@ -13,13 +32,13 @@ Write-Host "      Parallel Computing Auto-Test" -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 
 Write-Host "`n>>> [1/4] Pushing code to server..." -ForegroundColor Yellow
-scp -o StrictHostKeyChecking=no -i $Identity -P $Port wj.cpp "${Server}:${RemoteDir}/wj.cpp"
+scp -o StrictHostKeyChecking=no -i $Identity -P $Port $SourceFile "${Server}:${RemoteDir}/wj.cpp"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Push failed for wj.cpp! Check network or ssh keys." -ForegroundColor Red
     exit 1
 }
 
-scp -o StrictHostKeyChecking=no -i $Identity -P $Port Makefile "${Server}:${RemoteDir}/Makefile"
+scp -o StrictHostKeyChecking=no -i $Identity -P $Port $MakefilePath "${Server}:${RemoteDir}/Makefile"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Push failed for Makefile! Check network or ssh keys." -ForegroundColor Red
     exit 1
@@ -80,5 +99,5 @@ Write-Host "  Avg Real Time   : $avgTimeStr seconds" -ForegroundColor Green
 Write-Host "  ======================================"
 
 $logLine = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Threads: $Threads | Runs: $Runs | AvgTime: ${avgTimeStr}s | MD5: PASS"
-$logLine | Out-File -FilePath "experiment_result.log" -Append
-Write-Host "Saved to experiment_result.log"
+$logLine | Out-File -FilePath $LogPath -Append -Encoding Unicode
+Write-Host "Saved to $LogPath"

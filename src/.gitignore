@@ -1,0 +1,30 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.out
+jaccard_cluster
+jaccard_cluster.exe
+
+# Local build directories
+bin/
+build/
+out/
+cmake-build-*/
+
+# Editor and IDE files
+.vs/
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Generated logs and experiment outputs
+results/
+*.log
+result*.txt
+out*.txt
+*_check_*.txt
+short_k_test.fasta

@@ -12,7 +12,12 @@ phase1_times = [173.96, 89.85, 46.09, 24.47, 12.60, 8.52, 8.66]
 # Each point is the average of 3 remote runs on test2.fasta with MD5 PASS.
 phase2_times = [51.043, 26.810, 14.007, 7.507, 4.007, 2.837, 3.153]
 
-outdir = sys.argv[1] if len(sys.argv) >= 2 else '.'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+DEFAULT_OUTDIR = os.path.join(REPO_ROOT, 'report_images')
+
+outdir = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_OUTDIR
+os.makedirs(outdir, exist_ok=True)
 
 # Derived metrics
 phase1_speedup = [phase1_times[0] / t for t in phase1_times]
