@@ -14,14 +14,19 @@ Write-Host "=========================================" -ForegroundColor Cyan
 
 Write-Host "`n>>> [1/4] Pushing code to server..." -ForegroundColor Yellow
 scp -o StrictHostKeyChecking=no -i $Identity -P $Port wj.cpp "${Server}:${RemoteDir}/wj.cpp"
-
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Push failed! Check network or ssh keys." -ForegroundColor Red
+    Write-Host "Push failed for wj.cpp! Check network or ssh keys." -ForegroundColor Red
+    exit 1
+}
+
+scp -o StrictHostKeyChecking=no -i $Identity -P $Port Makefile "${Server}:${RemoteDir}/Makefile"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Push failed for Makefile! Check network or ssh keys." -ForegroundColor Red
     exit 1
 }
 
 Write-Host ">>> [2/4] Compiling on server..." -ForegroundColor Yellow
-$compileCmd = "cd $RemoteDir && g++ -O3 -mavx2 -fopenmp -pthread wj.cpp -lz -o jaccard_cluster_test"
+$compileCmd = "cd $RemoteDir && make clean TARGET=jaccard_cluster_test && make TARGET=jaccard_cluster_test"
 ssh -o StrictHostKeyChecking=no -i $Identity -p $Port $Server $compileCmd
 
 if ($LASTEXITCODE -ne 0) {

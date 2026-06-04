@@ -20,3 +20,9 @@ build/
 # Ignore local outputs and temporary files
 *test_output.txt
 *.log
+
+# Ignore generated experiment outputs
+result*.txt
+out*.txt
+*_check_*.txt
+short_k_test.fasta
