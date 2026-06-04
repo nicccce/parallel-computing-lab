@@ -88,7 +88,7 @@ KSEQ_INIT(gzFile, gzread)
 static constexpr int AA_NUM = 26;
 static constexpr int KMER_DIM = AA_NUM * AA_NUM * AA_NUM;
 static constexpr int K = 3;
-static constexpr int BLOCK = 256;
+static constexpr int BLOCK = 64;
 static constexpr int SPARSE_THRESHOLD = WJ_SPARSE_THRESHOLD;
 #if ENABLE_PHASE3_POSTINGS
 static constexpr double POSTING_ALPHA = 16.0;
@@ -174,35 +174,7 @@ static inline uint64_t sparse_dense_inter(const std::vector<KmerCount>& sp,
     return inter;
 }
 
-/* Early-termination variant: abort when inter can't reach needed_inter.
- * Uses remaining budget from sparse list to bound the maximum possible. */
-static inline uint64_t sparse_dense_inter_et(
-        const std::vector<KmerCount>& sp,
-        const uint16_t* dense_row,
-        uint64_t needed_inter) {
-    uint64_t inter = 0;
-    const int total = static_cast<int>(sp.size());
 
-    /* Compute suffix budget: sum of all sp[k].cnt from k to end */
-    /* We precompute total budget and subtract as we go */
-    uint64_t remaining_budget = 0;
-    for (const auto& kv : sp) {
-        remaining_budget += kv.cnt;
-    }
-
-    for (int k = 0; k < total; ++k) {
-        uint16_t other = dense_row[sp[k].id];
-        inter += std::min<uint32_t>(sp[k].cnt, other);
-        remaining_budget -= sp[k].cnt;
-
-        /* Early termination: even if all remaining entries match fully,
-         * inter + remaining_budget < needed_inter => impossible */
-        if (inter + remaining_budget < needed_inter) {
-            return inter;  /* caller will detect this fails threshold */
-        }
-    }
-    return inter;
-}
 
 /* ── Dense intersection kernels ───────────────────────────────────── */
 static inline uint64_t dense_inter_scalar(const uint16_t* __restrict__ a,
@@ -297,20 +269,13 @@ static inline uint64_t intersection(int i, int j,
                                      const uint16_t* nnz,
                                      const std::vector<KmerCount>* sparse,
                                      const uint16_t* freq_pool,
-                                     size_t padded_elems,
-                                     uint64_t needed_inter = 0) {
+                                     size_t padded_elems) {
     uint16_t min_nnz = std::min(nnz[i], nnz[j]);
 
     if (min_nnz < SPARSE_THRESHOLD) {
         /* Use the sparser sequence's list, look up in the denser's dense row */
         int sp_idx = (nnz[i] <= nnz[j]) ? i : j;
         int dn_idx = (sp_idx == i) ? j : i;
-        if (needed_inter > 0) {
-            return sparse_dense_inter_et(
-                sparse[sp_idx],
-                freq_pool + static_cast<size_t>(dn_idx) * padded_elems,
-                needed_inter);
-        }
         return sparse_dense_inter(
             sparse[sp_idx],
             freq_pool + static_cast<size_t>(dn_idx) * padded_elems);
@@ -593,7 +558,7 @@ int main(int argc, char* argv[]) {
         for (int ib = 0; ib < n; ib += BLOCK) {
             const int i_end = std::min(ib + BLOCK, n);
 
-            #pragma omp for schedule(dynamic, 2)
+            #pragma omp for schedule(dynamic)
             for (int i = ib; i < i_end; ++i) {
                 std::vector<int>& row_edges = edges_by_i[i];
                 row_edges.clear();
@@ -619,18 +584,10 @@ int main(int argc, char* argv[]) {
                             continue;
                         }
 
-                        /* Phase 5: compute needed_inter for early termination.
-                         * From inter >= threshold * (sum_i + sum_j - inter),
-                         * we get inter >= threshold * (sum_i + sum_j) / (1 + threshold).
-                         * Use floor (not ceil) to avoid false negatives. */
-                        uint64_t denom_est = static_cast<uint64_t>(freq_sums[i]) + freq_sums[j];
-                        uint64_t needed_inter = static_cast<uint64_t>(
-                            threshold * static_cast<double>(denom_est) / (1.0 + threshold));
-
-                        /* Adaptive intersection kernel with early termination */
+                        /* Adaptive intersection kernel */
                         uint64_t inter = intersection(
                             i, j, nnz.data(), sparse.data(),
-                            freq_pool, padded_elems, needed_inter);
+                            freq_pool, padded_elems);
 
                         if (similarity_pass(inter, freq_sums[i], freq_sums[j],
                                              threshold)) {
@@ -653,14 +610,10 @@ int main(int argc, char* argv[]) {
                             continue;
                         }
 
-                        /* Phase 5: compute needed_inter for early termination */
-                        uint64_t denom_est = static_cast<uint64_t>(freq_sums[i]) + freq_sums[j];
-                        uint64_t needed_inter = 0; /* disabled for debugging */
-
-                        /* Adaptive intersection kernel with early termination */
+                        /* Adaptive intersection kernel */
                         uint64_t inter = intersection(
                             i, j, nnz.data(), sparse.data(),
-                            freq_pool, padded_elems, needed_inter);
+                            freq_pool, padded_elems);
 
                         if (similarity_pass(inter, freq_sums[i], freq_sums[j],
                                              threshold)) {
@@ -687,23 +640,10 @@ int main(int argc, char* argv[]) {
     /* ── Flatten and output ───────────────────────────────────────── */
     uf.flatten();
 
-    /* Phase 5: Buffered output — build entire output string then write once */
-    {
-        std::string buf;
-        buf.reserve(static_cast<size_t>(n) * 6);
-        for (int i = 0; i < n; ++i) {
-            if (i > 0) buf += ' ';
-            char num[12];
-            int len = std::snprintf(num, sizeof(num), "%d", uf.parent[i]);
-            buf.append(num, static_cast<size_t>(len));
-        }
-        buf += '\n';
-#ifdef _WIN32
-        _write(1, buf.data(), static_cast<unsigned int>(buf.size()));
-#else
-        (void)::write(1, buf.data(), buf.size());
-#endif
+    for (int i = 0; i < n; ++i) {
+        std::cout << uf.parent[i] << (i == n - 1 ? "" : " ");
     }
+    std::cout << '\n';
 
 #ifdef _WIN32
     _aligned_free(freq_pool);
