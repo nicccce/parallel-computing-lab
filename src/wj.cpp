@@ -167,9 +167,18 @@ static inline bool length_bound_may_pass(uint32_t sum_a, uint32_t sum_b,
 static inline uint64_t sparse_dense_inter(const std::vector<KmerCount>& sp,
                                            const uint16_t* dense_row) {
     uint64_t inter = 0;
-    for (const auto& kv : sp) {
-        uint16_t other = dense_row[kv.id];
-        inter += std::min<uint32_t>(kv.cnt, other);
+    const size_t sz = sp.size();
+    for (size_t i = 0; i < sz; ++i) {
+        // Software Prefetching: Bring the next required dense_row element into L1/L2 cache
+        // to hide memory latency since 'id' is non-contiguous.
+        if (i + 4 < sz) {
+            #if defined(__GNUC__) || defined(__clang__)
+            __builtin_prefetch(&dense_row[sp[i + 4].id], 0, 1);
+            #endif
+        }
+        
+        uint16_t other = dense_row[sp[i].id];
+        inter += std::min<uint32_t>(sp[i].cnt, other);
     }
     return inter;
 }
@@ -478,7 +487,13 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    std::memset(freq_pool, 0, total_bytes);
+    /* NUMA First-Touch: Fault the physical pages evenly across all CPU sockets
+     * by initializing the memory pool in parallel using a static schedule.
+     * This is critical to avoid Memory Wall on 32/64 thread runs. */
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) {
+        std::memset(freq_pool + static_cast<size_t>(i) * padded_elems, 0, padded_row);
+    }
 
     /* ── Per-sequence metadata ────────────────────────────────────── */
     std::vector<uint32_t> freq_sums(n, 0);
