@@ -1,4 +1,5 @@
 CXX = g++
+# CXXFLAGS = -O3 -march=icelake-server -fopenmp -pthread
 CXXFLAGS = -O3 -mavx2 -fopenmp -pthread
 EXTRA_CXXFLAGS ?= 
 LIBS = -lz

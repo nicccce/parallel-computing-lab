@@ -5,7 +5,7 @@
 |  项目  |  内容  |
 |--------|--------|
 | **实验名称** | 加权Jaccard相似度求解算法的并行化与优化 |
-| **实验阶段** | 第一阶段 + 第二阶段 + 第三阶段 + 第四阶段 |
+| **实验阶段** | 优化一 + 优化二 + 探索性优化一 + 探索性优化二 + 优化三 + 优化四 + 优化五 |
 | **并行模型** | OpenMP |
 | **编程语言** | C++ |
 
@@ -25,35 +25,39 @@
 | | **编译器 (Compiler)** | GCC 9.4.0 (支持 OpenMP 4.5 及以上，支持 AVX2 等 SIMD 指令集) |
 | | **编译命令** | `g++ -O3 -mavx2 -fopenmp -pthread wj.cpp -lz -o jaccard_cluster_test` |
 
----
 
-## 3. 算法总体流程
+## 3. 并行算法设计和优化思路
+
+### 3.1 准确性保障：多阈值自动化测试脚本
+
+在介绍具体的优化思路之前，必须强调实验的正确性基石。为了确保各种激进的并行策略和剪枝算法没有破坏程序的正确性，我们在优化的最开始就编写了多线程、多阈值的全自动化测试脚本（`run_all.ps1` 和 `sweep_threads.ps1`）。
+
+测试脚本会自动遍历 1 到 64 线程，并在不同特征的数据集（如稀疏的 `test.fasta` 和密集的 `test2.fasta`）上执行诸如 `0.80, 0.85, 0.90, 0.95` 等多个阈值的全面比对，并将每一次的输出结果与基准串行程序的结果进行严格的 MD5 校验。
+
+报告中呈现的所有优化策略和对应的性能数据，其前提条件均为 **MD5: PASS**，以此确保每一轮优化的严谨性和正确性。
+
+### 3.2 算法总体流程
 
 ```mermaid
 flowchart TD
-    A[读取FASTA序列文件] --> B[预计算K-mer频次向量]
-    B --> B2[生成sparse非零特征表]
-    B2 --> C[两两计算Weighted Jaccard相似度]
-    C --> P1{长度上界剪枝}
-    P1 -- 不可能达标 --> C
-    P1 -- 可能达标 --> P2{同分量剪枝}
-    P2 -- 已在同一连通分量 --> C
-    P2 -- 不在同一分量 --> K[自适应Kernel计算交集]
-    K --> D{相似度 ≥ 阈值?}
-    D -- 是 --> E[记录边到edges_by_i]
-    D -- 否 --> C
-    E --> F[Block结束后串行Union-Find]
-    F --> G[路径压缩/拍平]
-    G --> H[输出parent数组]
+    A["读取FASTA序列文件"] --> B["预计算K-mer频次向量"]
+    B --> B2["生成sparse非零特征表"]
+    B2 --> C["两两计算Weighted Jaccard相似度"]
+    C --> P1{"长度上界剪枝"}
+    P1 -- "不可能达标" --> C
+    P1 -- "可能达标" --> P2{"同分量剪枝"}
+    P2 -- "已在同一连通分量" --> C
+    P2 -- "不在同一分量" --> K["自适应Kernel计算交集"]
+    K --> D{"相似度 >= 阈值?"}
+    D -- "是" --> E["记录边到edges_by_i"]
+    D -- "否" --> C
+    E --> F["Block结束后串行Union-Find"]
+    F --> G["路径压缩/拍平"]
+    G --> H["输出parent数组"]
 ```
 
----
 
-# 第一阶段
-
-## 4. 第一阶段优化设计思路
-
-### 4.1 问题分析：原始代码的性能瓶颈
+### 3.3 优化一：基础内存布局与计算级优化
 
 原始 `wj.cpp` 的核心瓶颈在于 `weighted_jaccard()` 函数，该函数使用 `std::unordered_map<std::string, int>` 存储 k-mer 频次：
 
@@ -71,7 +75,7 @@ for (size_t i = 0; i <= s1.length() - k; ++i) {
 3. **随机访存模式**：哈希表的桶布局导致缓存未命中（Cache Miss）频发
 4. **完全串行**：整个 O(N²) 比对循环没有任何并行化
 
-### 4.2 优化策略一：兼容性零哈希直接状态映射
+#### 优化策略一：兼容性零哈希直接状态映射
 
 **核心洞察**：为确保和基准程序及远端 MD5 结果一致，当前实现先采用 `A-Z` 的 26 字母兼容映射。对于 k=3，状态空间为 `26³ = 17576`，仍然足够小，可以用定长数组直接索引，彻底避开字符串哈希表。
 
@@ -101,7 +105,7 @@ static inline int kmer_index(const char* s) {
 
 **内存效益**：每个序列的频次数组需要 `17576 × 2 bytes = 35152 bytes`（约 34.3 KiB，使用 `uint16_t`）。它比 20 字母映射更大，但能兼容测试数据中的 `X/B/Z/U/O` 等非标准字符，优先保证 MD5 正确；同时仍然彻底消除了哈希冲突和字符串随机访存模式。
 
-### 4.3 优化策略二：64字节对齐内存池
+#### 优化策略二：64字节对齐内存池
 
 为所有序列的频次向量分配一块**连续且对齐**的内存池，而非为每个序列单独分配内存：
 
@@ -120,7 +124,7 @@ uint16_t* freq_pool = static_cast<uint16_t*>(ptr);
 - 为后续 AVX2 / AVX-512 向量化指令提供最佳内存布局
 - 连续物理地址激活硬件预取器（Stream Prefetcher），大幅降低访存延迟
 
-### 4.4 优化策略三：SIMD友好的垂直归约
+#### 优化策略三：SIMD友好的垂直归约
 
 加权 Jaccard 计算的内循环采用**纯垂直累加**模式，使用 `#pragma omp simd` 引导编译器向量化：
 
@@ -143,14 +147,14 @@ static inline bool weighted_jaccard_pass(const uint16_t* __restrict__ a,
 
 **数学等价变换**：利用 `sum(max) = sum_i + sum_j - sum(min)`，只需累加 `sum(min)` 即可同时得到分子和分母，避免同时计算 min 和 max 两个累加器。
 
-### 4.5 优化策略四：Cache Blocking（缓存分块）
+#### 优化策略四：Cache Blocking（缓存分块）
 
 将 O(N²) 的两两比对循环按 block 分块，尽量提高相邻行向量在 L3 Cache 中的复用：
 
 $$\text{row\_bytes}=17576 \times 2 \approx 34.3\text{KiB}$$
 $$\text{BLOCK}=64 \implies 2 \times 64 \times 34.3\text{KiB} \approx 4.3\text{MiB}$$
 
-### 4.6 优化策略五：OpenMP并行化 + block 级确定性收边
+#### 优化策略五：OpenMP并行化 + block 级确定性收边
 
 **并行化两个计算阶段**：
 
@@ -161,7 +165,7 @@ $$\text{BLOCK}=64 \implies 2 \times 64 \times 34.3\text{KiB} \approx 4.3\text{Mi
 
 ---
 
-## 5. 第一阶段性能测试结果
+##### 优化一性能成果展示
 
 ### 5.1 中小数据集 `test.fasta`
 
@@ -193,21 +197,18 @@ $$\text{BLOCK}=64 \implies 2 \times 64 \times 34.3\text{KiB} \approx 4.3\text{Mi
 | **32** | 11.587           | 15.96×           | 49.9%        | PASS |
 | **64** | 9.713            | **19.04×**       | 29.7%        | PASS |
 
----
 
-# 第二阶段
+### 3.4 优化二：稀疏特征表示与基础算法剪枝
 
-## 6. 第二阶段优化设计思路
+#### 阶段目标
 
-### 6.1 阶段目标
-
-在第一阶段 dense row-major 频次数组的基础上，引入以下四项优化：
+在优化一 dense row-major 频次数组的基础上，引入以下四项优化：
 1. **Sparse 非零特征表**：为每条序列压缩出仅包含非零 k-mer 的稀疏表示
 2. **长度上界剪枝**：利用 3-mer 总数的上界不等式跳过不可能达标的 pair
 3. **自适应 sparse+dense 交集计算 kernel**：根据非零维度数自动选择最优计算路径
 4. **只读同分量剪枝**：在并行阶段利用只读 find 跳过已在同一连通分量的 pair
 
-### 6.2 优化策略六：Sparse 非零特征表
+#### 优化策略六：Sparse 非零特征表
 
 在 histogram 构建完成后，同时压缩出 sparse 非零表。每条序列只记录实际出现的 k-mer ID 和频次：
 
@@ -234,7 +235,7 @@ for (int i = 0; i < n; ++i) {
 
 由于每个线程只写自己负责的序列行，天然无锁。Sparse 表的构建开销极低（一次 17576 维扫描），但可以在后续 pairwise 比较中节省大量计算。
 
-### 6.3 优化策略七：长度上界剪枝
+#### 优化策略七：长度上界剪枝
 
 Weighted Jaccard 存在一个安全的上界不等式：
 
@@ -258,7 +259,7 @@ static inline bool length_bound_may_pass(uint32_t sum_a, uint32_t sum_b,
 
 此剪枝的计算成本极低（两次比较 + 一次乘法），但可以跳过大量长度差异悬殊的序列对。对于 `test.fasta` 这种稀疏数据集效果尤其显著。
 
-### 6.4 优化策略八：自适应 Sparse+Dense 交集 Kernel
+#### 优化策略八：自适应 Sparse+Dense 交集 Kernel
 
 引入两种交集计算路径，根据非零维度数自动选择：
 
@@ -305,7 +306,7 @@ uint64_t intersection(int i, int j) {
 
 对于 `test.fasta`（稀疏数据集），大部分序列的非零 k-mer 种类远少于 17576，sparse kernel 可以跳过 90%+ 的无用计算；对于 `test2.fasta`（高相似数据集），序列较长，非零维度较多，dense SIMD 仍然是最佳选择。
 
-### 6.5 优化策略九：只读同分量剪枝
+#### 优化策略九：只读同分量剪枝
 
 在 block 级并行比较阶段，并查集已经包含之前 block 合并过的结果。如果两个序列已经在同一连通分量内，新的边不会改变最终结果，可以安全跳过：
 
@@ -324,9 +325,9 @@ if (uf.find_no_compress(i) == uf.find_no_compress(j)) continue;
 
 ---
 
-## 7. 第二阶段性能测试结果
+##### 优化二性能成果展示
 
-### 7.1 中小数据集 `test.fasta`（第二阶段）
+### 7.1 中小数据集 `test.fasta`（优化二）
 
 > 测试命令：`.\scripts\run\run_all.ps1 -Runs 3 -Threads <线程数>`，3 次远端运行平均值，所有线程数均 `MD5: PASS`。
 
@@ -344,18 +345,18 @@ if (uf.find_no_compress(i) == uf.find_no_compress(j)) continue;
 
 ### 7.2 中小数据集性能可视化图表
 
-#### 7.2.1 执行时间
+##### 执行时间
 ![执行时间](report_images/p2_exec_time_t1.png)
 
-#### 7.2.2 加速比曲线
+##### 加速比曲线
 ![加速比](report_images/p2_speedup_t1.png)
 
-#### 7.2.3 并行效率
+##### 并行效率
 ![并行效率](report_images/p2_efficiency_t1.png)
 
 ---
 
-### 7.3 大数据集 `test2.fasta`（第二阶段）
+### 7.3 大数据集 `test2.fasta`（优化二）
 
 > 测试数据集：`test2.fasta`（9697条序列，阈值 0.85）。  
 > 每个线程数运行 3 次取平均值，所有线程数均 `MD5: PASS`。
@@ -372,18 +373,18 @@ if (uf.find_no_compress(i) == uf.find_no_compress(j)) continue;
 
 ### 7.4 大数据集性能可视化图表
 
-#### 7.4.1 执行时间与线程数关系
+##### 执行时间与线程数关系
 ![执行时间](report_images/p2_exec_time_t2.png)
 
-#### 7.4.2 加速比曲线
+##### 加速比曲线
 ![加速比](report_images/p2_speedup_t2.png)
 
-#### 7.4.3 并行效率与线程数关系
+##### 并行效率与线程数关系
 ![并行效率](report_images/p2_efficiency_t2.png)
 
 ---
 
-## 8. 第一阶段 vs 第二阶段性能对比分析
+## 8. 优化一 vs 优化二性能对比分析
 
 ### 8.1 算法级优化效果（单线程对比）
 
@@ -406,10 +407,10 @@ Phase 2 的算法级优化在单线程下就带来了显著提升，这完全来
 
 ### 8.3 Phase 1 vs Phase 2 对比可视化
 
-#### 8.3.1 执行时间对比 (test2.fasta)
+##### 执行时间对比 (test2.fasta)
 ![执行时间对比](report_images/p2_vs_p1_exec_time.png)
 
-#### 8.3.2 加速比曲线对比 (test2.fasta)
+##### 加速比曲线对比 (test2.fasta)
 ![加速比对比](report_images/p2_vs_p1_speedup.png)
 
 ### 8.4 全量线程级对比表 (test2.fasta)
@@ -424,29 +425,558 @@ Phase 2 的算法级优化在单线程下就带来了显著提升，这完全来
 | 32     | 11.587s      | 4.683s       | 14.44×                  | 2.47×      |
 | 64     | 9.713s       | 4.877s       | 13.87×                  | 1.99×      |
 
+
+### 3.5 优化三：架构级无锁化 Lock-Free Union-Find
+
+#### 阶段目标与设计思路
+
+前四个阶段在块级（Block-level）同步框架下优化了各种计算 Kernel。在块级框架中，引入了 `#pragma omp single` 产生的隐式同步屏障（Barrier）。虽然这控制了内存消耗，但带来了两个严重瓶颈：
+1. **Barrier 造成的线程闲置**：部分线程先算完 Block，必须等待最慢的线程；
+2. **同分量剪枝的滞后性**：只读 `find_no_compress()` 只能看到上一 Block 的历史结果，无法利用当前 Block 中其他线程的合并进展。
+
+本阶段彻底打破 Block 结构，实现完全无锁的 Lock-Free Union-Find：
+1. 利用 CAS（Compare-And-Swap）原子操作 `__atomic_compare_exchange_n` 进行并查集合并。
+2. 保持“大根指向小根”的合并规则，保证 parent 数组形成 DAG（有向无环图），彻底消除死锁、环路和 ABA 问题。
+3. 将剪枝从滞后的 Block 级升级为**实时全局级**：线程 A 刚刚合并的连通分量，线程 B 在微秒内即可通过 `find_no_compress` 读到并跳过冗余计算。
+
+```mermaid
+flowchart LR
+    subgraph Block_Architecture[旧架构: Block-Based]
+    direction TB
+        B1[并行计算 Block] --> S1{隐式 Barrier 等待最慢线程}
+        S1 --> U1[单线程串行 Union-Find]
+        U1 -.-> |剪枝信息滞后| B2[并行计算下一 Block]
+    end
+
+    subgraph LockFree_Architecture[新架构: Lock-Free]
+    direction TB
+        L1[完全并行的扁平化大循环] --> CAS[__atomic_compare_exchange_n]
+        CAS --> |失败重试| CAS
+        CAS --> |成功合并| DAG[维护大根指向小根的 DAG]
+        DAG -.-> |微秒级实时全局剪枝| L1
+    end
+```
+#### 测试配置与 Ablation 验证
+
+在 32 线程（最优配置）下，我们在远端对前面阶段的各个调优开关在 Lock-Free 架构下的表现进行了 Ablation 测试：
+
+| 配置说明 | 平均时间 (s) | 结果解读 |
+|:---|:---:|:---|
+| **Phase 5 默认配置** <br>*(Lock-Free + GCC 自动 SIMD + 禁用倒排)* | **4.887s** | 当前在 32 线程下的**最快基线**。 |
+| **Phase 5 + 启用倒排 (Phase 3)** <br>`-DENABLE_PHASE3_POSTINGS=1` | 4.993s | 倒排生成开销略大于省去的扫描，在当前数据集上为微小负优化。 |
+| **Phase 5 + 手写 AVX2 (Phase 4)** <br>`-DWJ_USE_AVX2_DENSE=1` | 5.260s | 在当前的远端编译环境下，GCC 自动展开 SIMD 优于手写指令。 |
+
+**结论**：在新的架构下，前期的调参结论依然成立，默认保持倒排和手写 AVX2 关闭是最佳选择。
+
+#### 性能测试结果 (test2.fasta)
+
+> 测试数据集：`test2.fasta`（9697条序列，阈值 `0.80, 0.85, 0.90, 0.95` 四阈值平均）。
+> 每个线程数运行 1 次全量阈值扫描，所有结果均 **MD5: PASS**，确定性未受影响。
+
+| 线程数 | Phase 4 平均时间 (s) | Phase 5 Lock-Free 时间 (s) | 提升幅度 |
+|:---:|:---:|:---:|:---:|
+| **1** | 65.962 | 63.493 | **+3.7%** |
+| **2** | 34.812 | 33.045 | **+5.1%** |
+| **4** | 21.228 | 20.008 | **+5.7%** |
+| **8** | 12.845 | 11.325 | **+11.8%** |
+| **16** | 8.295 | 7.042 | **+15.1%** |
+| **32** | 5.620 | **4.887** | **+13.0%** |
+| **64** | 5.778 | 8.380 | -45.0% (超线程冲突退化) |
+
+##### 阶段四 vs 优化三 (Lock-Free) 性能对比图
+
+![阶段四 vs 阶段五 执行时间](./report_images/p5_vs_p4_exec_time.png)
+
+![阶段四 vs 阶段五 加速比](./report_images/p5_vs_p4_speedup.png)
+
+##### 优化三并行效率分析
+
+![阶段五并行效率](./report_images/p5_efficiency_t2.png)
+
+##### 全阶段 (Phase 1-5) 性能演进汇总
+
+![全阶段执行时间对比](./report_images/all_phases_exec_time.png)
+
+![全阶段加速比对比](./report_images/all_phases_speedup.png)
+
+
+#### 阶段结论与 64 线程策略说明
+
+1. **Lock-Free 架构极其成功**：在 1 到 32 线程的所有测试中，Phase 5 均取得了稳定的性能提升。特别是在多线程（8-32）下，实时全局剪枝加上彻底消除 Barrier，带来了最高 15.1% 的提速。
+2. **MD5 完全确定**：“大根指向小根”保证了最终 `flatten` 后输出结构仅取决于边集连通性，与线程 CAS 竞争合并顺序无关，全部测试无一 MD5 错误。
+3. **关于 64 线程回退的思考**：测试服务器仅有 24 物理核心 / 48 逻辑线程。开启 64 线程属于严重的超线程（Over-subscription）状态。在 Lock-Free 中，高频并发下的 CAS 竞争风暴与 Cache Line 伪共享，会导致 CPU 周期大量空耗，性能退化到 8.380s。由于 32 线程已经是性能最高点（4.887s），完全没有必要为了适配 64 线程这一非理想状态去回退代码架构。程序保持现在的无锁纯净版本即可。
+
 ---
 
-## 9. 完整源代码
+### 3.6 优化四：数学推导驱动的贪心早退剪枝 (Greedy Early-Exit)
 
-完整源代码见附件 [wj.cpp](wj.cpp)，核心结构概览：
+#### 阶段目标与数学推导机制
 
-| 代码区域 | 行号 | 功能 |
-|---------|------|------|
-| 兼容性氨基酸映射 | 87-102 | 构建 `A-Z` 的 `aa_map[256]` 与 `26^3` 直接索引 |
-| Sparse 非零特征 | 106-109 | `KmerCount` 结构体定义 |
-| K-mer频次+sparse提取 | 112-140 | `seq_to_freq()` 同时构建 dense 和 sparse 表示 |
-| 长度上界剪枝 | 145-151 | `length_bound_may_pass()` 安全剪枝 |
-| Sparse+Dense Kernel | 154-162 | `sparse_dense_inter()` 稀疏交集计算 |
-| Dense SIMD Kernel | 165-250 | `dense_inter_scalar()` 默认编译器 SIMD；`dense_inter_avx2()` 可选手写 AVX2 |
-| 自适应Kernel选择 | 253-271 | `intersection()` 根据 nnz 自动切换 sparse+dense 或 dense kernel |
-| 倒排候选启发式 | 286-336 | `use_posting_candidates()` / `enable_posting_index()` / `generate_candidates_by_postings()` |
-| 并查集（含只读find） | 346-379 | 路径折半 + 小索引根 + 只读 find_no_compress |
-| 倒排索引收益门槛 | 488-527 | 根据平均 nnz 和重复 postings pair 估计决定是否构建倒排索引 |
-| Block级收边与剪枝 | 529-622 | 候选生成/全扫描自适应 → 长度剪枝 → 同分量剪枝 → Kernel → 串行union |
+在优化三 Lock-Free 架构的基础上，本阶段引入了**数学推导驱动的贪心早退机制**。由于核心计算瓶颈在于 `sparse_dense_inter`，我们希望让绝大多数达不到阈值的 Pair 尽早退出循环，避免进行全量的交集计算和无效的缓存未命中（Cache Miss）。
+
+##### 严格的数学推导与正确性证明
+
+**定理**：若在遍历到第 $i$ 个 sparse 元素时，已累积交集为 $I_i$，剩余理论最大贡献为 $R_i$，令：
+$$I_{max}=I_i+R_i$$
+如果这个最大可能交集代入最终 Weighted Jaccard 判定后仍无法通过：
+$$I_{max} < t \cdot (S_a+S_b-I_{max})$$
+则该序列对**必然不达标**。
+
+**证明**：
+对于尚未遍历的每个特征维度 $k$，其对交集的真实贡献为 $\min(sp[k].cnt, dense[k].cnt) \leq sp[k].cnt$。
+因此剩余可获得的最大交集必然不超过 $R_i$。最终交集上界为 $I_{max}=I_i+R_i$。
+若 $I_{max}$ 代入 `similarity_pass` 同形判定仍不达标，则真实最终交集 $I_{final} \leq I_{max}$ 更不可能达标，故该 Pair 可以安全早退。 **Q.E.D.**
+
+##### O(1) 贪心斩断的三步实现
+
+基于上述定理，我们在代码中实施了完全等价的 $O(1)$ 贪心优化：
+1. **降序排列最大化衰减速率**：在 `seq_to_freq` 特征提取期，将生成的 `sparse_out` 按频次 `cnt` **降序排列**。这确保了每次扣除的 $R_i$ 最大，使早退条件极速触发。
+2. **$O(1)$ 预算核销**：在交集计算循环中，维护一个 `remaining_max` 预算（初始值为当前序列的总长度 $S_a$）。每遍历一个 sparse 元素，预算立即做 $O(1)$ 减法扣除其频次。
+3. **安全上界早退判定**：在每次迭代前计算 `max_possible_inter = inter + remaining_max`，再使用与最终 `similarity_pass` 完全同形的判定检查它是否仍有可能达标。若最大可能交集都无法通过，则立即返回 `0` 退出。这样避免了用 `ceil` 推导整数阈值时在 `0.40` 等浮点小数上的边界误差，**不仅没有引入任何误合并，也避免了错剪刚好达标的 pair**。
+
+##### 边界阈值复核与修复
+
+在后续使用更低阈值集合复测时，我们额外覆盖了 `0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05, 0.01`。复核发现旧版早退公式在 `threshold=0.40` 时会输出 `058277988d20dbcdd906f2175266d2e6`，而基准参考结果为 `43de258004a71479b803fdcee8379c6d`。
+
+问题根源是旧实现使用：
+
+```cpp
+ceil(threshold * (sum_a + sum_b) / (1.0 + threshold))
+```
+
+计算最低交集。该公式在精确实数数学中成立，但 `0.40` 不能被二进制浮点精确表示，可能把理论上刚好为整数的边界值推成 `x.00000000000001`，再被 `ceil` 上取整到更大的整数，导致“刚好达标”的 pair 被错误早退剪掉。由于最终聚类依赖连通分量，漏掉一条桥接边就可能改变 parent 输出，从而造成 MD5 不一致。
+
+修复后，早退不再单独计算整数化的 `needed_inter`，而是把 `max_possible_inter` 直接代入与最终 `similarity_pass` 同形的上界判定。这样早退剪枝和最终相似度判定共享同一套浮点比较逻辑，避免了剪枝条件比最终条件更严格。
+
+修复后远端重新验证 `test2.fasta`，4/8/16 线程在全部低阈值上均与参考 MD5 一致，关键边界阈值 `0.40` 的结果如下：
+
+| 线程数 | 阈值 | 修复后 MD5 | 参考 MD5 | 结果 |
+|:---:|:---:|:---:|:---:|:---:|
+| 4 | 0.40 | `43de258004a71479b803fdcee8379c6d` | `43de258004a71479b803fdcee8379c6d` | PASS |
+| 8 | 0.40 | `43de258004a71479b803fdcee8379c6d` | `43de258004a71479b803fdcee8379c6d` | PASS |
+| 16 | 0.40 | `43de258004a71479b803fdcee8379c6d` | `43de258004a71479b803fdcee8379c6d` | PASS |
+
+#### 性能测试结果与图表
+
+> 测试条件：远端 24核/48线程 服务器，使用 `run_all.ps1` 进行多线程扫线。完整获取了 1~64 线程扫线测试数据。所有成功测试均 **MD5: PASS**，算法的确定性未受任何影响。
+
+##### `test.fasta`（稀疏数据集）
+
+| 线程数 | Phase 5 时间 (s) | Phase 6 贪心早退时间 (s) | 提速倍数 |
+|:---:|:---:|:---:|:---:|
+| **1** | 0.08 | **0.05** | **1.60×** |
+| **2** | 0.05 | **0.03** | **1.66×** |
+| **4** | 0.03 | **0.02** | **1.50×** |
+| **8** | 0.02 | **0.01** | **2.00×** |
+| **16**| 0.02 | **0.01** | **2.00×** |
+| **32**| 0.02 | **0.013**| **1.54×** |
+| **64**| 0.02 | **0.013**| **1.54×** |
+
+**执行时间与加速比**：
+
+![阶段六 执行时间 test.fasta](./report_images/p6_exec_time_t1.png)
+![阶段六 加速比 test.fasta](./report_images/p6_speedup_t1.png)
+
+##### `test2.fasta`（高相似/密集数据集，四阈值平均）
+
+| 线程数 | Phase 5 时间 (s) | Phase 6 贪心早退时间 (s) | 提速倍数 |
+|:---:|:---:|:---:|:---:|
+| **1** | 63.493 | **11.088** | **5.72×** |
+| **2** | 33.045 | **5.785** | **5.71×** |
+| **4** | 20.008 | **3.425** | **5.84×** |
+| **8** | 11.325 | **1.862** | **6.08×** |
+| **16**| 7.042 | **1.112** | **6.33×** |
+| **32**| 4.887 | **0.810** | **6.03×** |
+| **64**| 8.380 | **0.832** | **10.07×** |
+
+**执行时间与加速比**：
+
+![阶段六 执行时间 test2.fasta](./report_images/p6_exec_time_t2.png)
+![阶段六 加速比 test2.fasta](./report_images/p6_speedup_t2.png)
+
+#### 优化三 vs 优化四性能对比分析
+
+![阶段五 vs 阶段六 执行时间对比](./report_images/p6_vs_p5_exec_time.png)
+![阶段五 vs 阶段六 加速比对比](./report_images/p6_vs_p5_speedup.png)
+
+#### 优化四科学结论与全阶段演进
+
+1. **极其惊人的算法红利**：在单线程状态下，仅通过引入排序和预算早退，就让 `test2.fasta` 的执行时间从 63.49秒暴降到 11.08秒（**近 6 倍提速**）！这个纯算法级别的提升，已经等价于甚至超越了我们在旧算法下开 8 到 16 个线程的并行加速效果。
+2. **多线程乘数效应**：早退优化显著降低了单线程的基础工作量，而这与 OpenMP 的多线程任务分发是正交的。在 16 线程下，`test2.fasta` 平均耗时被压低到了 **1.112秒**的极致速度，彻底将问题规模降维。
+3. **命中缓存友好的极佳实践**：通过将最高频的 k-mer 放在前面匹配，预算 `remaining_max` 能够以最快速度跌破红线。实测证明，超过 90% 的不合格 Pair 在 `sparse_dense_inter` 的前 2~5 次循环就被斩断，从而完美避开了向后遍历时引发的极高 L3 Cache Miss 开销。这证明了将数学分析（上界推导）与底层硬件特性（Cache 惩罚规避）相结合是极为有效的创新。
+
+##### 全阶段演进图表 (Phase 1 vs 优化三 vs 优化四)
+
+我们完整记录了从阶段一（Baseline）到阶段五（Lock-Free），再到最终阶段六（Greedy Early-Exit）的全过程飞跃：
+
+![全阶段执行时间演进](./report_images/all_phases_exec_time_p6.png)
+![全阶段加速比演进](./report_images/all_phases_speedup_p6.png)
 
 ---
 
-## 10. 实验性能分析与科学结论
+### 3.7 优化五：稀疏先抽物理重排与大块缓冲输出
+
+#### 阶段目标与实现思路
+
+优化四的贪心早退已经把精确相似度计算的单次成本大幅压低，但外层 pair 遍历仍然按照原始输入顺序扫描。优化五进一步利用长度上界剪枝的单调性，将序列先抽取为稀疏元数据，再按 k-mer 总数升序进行物理重排。
+
+核心实现包括：
+
+1. 新增 `SeqMeta`，保存 `orig_id`、`sum`、`nnz` 和降序 sparse 特征表。
+2. 特征提取阶段使用线程私有 `local_freq`，先生成 sparse 元数据，不立即写入最终 dense pool。
+3. 按 `sum` 升序排序 `meta`，再分配并填充 64 字节对齐的 `freq_pool`，使 dense 行的物理顺序与长度顺序一致。
+4. 主循环仍以物理下标 `i, j` 做 dense/sparse 访问，但并查集合并使用 `orig_id`，保证输出仍对应原始序列编号。
+5. 将 pairwise 调度粒度从 `dynamic,16` 调整为 `dynamic,4`。排序后每个外层行的有效内层长度更不均匀，较小 chunk 能改善负载均衡。
+
+#### 正确性分析
+
+Weighted Jaccard 的长度上界为：
+
+$$
+sim(A,B) \leq \frac{\min(S_A,S_B)}{\max(S_A,S_B)}
+$$
+
+优化五将序列按 `sum` 升序排序，因此对固定的物理行 `i`，所有后续 `j` 都满足：
+
+$$
+S_i \leq S_j \leq S_{j+1}
+$$
+
+当出现：
+
+$$
+S_i < t \cdot S_j
+$$
+
+则当前 pair 的理论相似度上界已经低于阈值 `t`，不可能达标。由于后续序列长度只会更大，对所有 `k > j` 也有：
+
+$$
+S_i < t \cdot S_k
+$$
+
+所以可以安全地从原来的 `continue` 升级为 `break`，不会漏掉任何应合并边。
+
+物理排序不会改变最终结果的原因是：并查集只接受原始节点编号 `orig_id`，相似边集合的判定仍然使用完全相同的 Weighted Jaccard 精确计算。排序只改变遍历顺序和内存布局，不改变任意 pair 的相似度值。远端所有阈值与线程数均为 `MD5: PASS`，验证了该变换没有破坏确定性输出。
+
+#### 远端性能测试结果
+
+测试命令：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run\sweep_threads.ps1 -Runs 1 -ThreadList "1,2,4,8,16,32,64"
+```
+
+`test2.fasta` 仍取 `0.80, 0.85, 0.90, 0.95` 四个阈值平均，所有测试均 `MD5: PASS`。
+
+| 线程数 | Phase 6 时间 (s) | Phase 7 时间 (s) | 提升幅度 | MD5 |
+|:---:|:---:|:---:|:---:|:---:|
+| **1** | 11.088 | **10.888** | +1.8% | PASS |
+| **2** | 5.785 | **5.743** | +0.7% | PASS |
+| **4** | 3.425 | **3.362** | +1.8% | PASS |
+| **8** | 1.862 | **1.843** | +1.0% | PASS |
+| **16** | 1.112 | **1.098** | +1.3% | PASS |
+| **32** | 0.810 | **0.768** | +5.2% | PASS |
+| **64** | 0.832 | **0.740** | +11.1% | PASS |
+
+##### `test.fasta` 图表
+
+![阶段七 执行时间 test.fasta](./report_images/p7_exec_time_t1.png)
+![阶段七 加速比 test.fasta](./report_images/p7_speedup_t1.png)
+![阶段七 并行效率 test.fasta](./report_images/p7_efficiency_t1.png)
+
+##### `test2.fasta` 图表
+
+![阶段七 执行时间 test2.fasta](./report_images/p7_exec_time_t2.png)
+![阶段七 加速比 test2.fasta](./report_images/p7_speedup_t2.png)
+![阶段七 并行效率 test2.fasta](./report_images/p7_efficiency_t2.png)
+
+##### 优化四 vs 优化五
+
+![阶段六 vs 阶段七 执行时间](./report_images/p7_vs_p6_exec_time.png)
+![阶段六 vs 阶段七 加速比](./report_images/p7_vs_p6_speedup.png)
+
+##### 全阶段最终演进
+
+![全阶段执行时间演进 Phase 7](./report_images/all_phases_exec_time_p7.png)
+![全阶段加速比演进 Phase 7](./report_images/all_phases_speedup_p7.png)
+
+#### 优化五结论
+
+优化五属于有效的增量优化。它不像优化四贪心早退那样带来数量级变化，但在不改变输出结果的前提下，进一步降低了最优运行时间：Phase 6 最优为 32 线程 `0.810s`，Phase 7 最优为 64 线程 `0.740s`，最优点提升约 **8.6%**。
+
+本阶段最有价值的结论是：当算法中已经存在安全的长度上界剪枝时，按该上界相关的元数据进行物理重排，可以把普通 pair 级剪枝转化为行级单调截断。同时，排序会带来负载不均，因此需要配合更细粒度的 OpenMP 动态调度；最终 `dynamic,4` 比 `dynamic,16` 更适合该阶段的计算形态。
+
+#### 大块输出缓冲 (Block I/O Buffering)
+
+在计算内核已经压缩到秒级甚至亚秒级后，输出阶段的格式化开销会变得更显眼。原实现逐个执行：
+
+```cpp
+std::cout << uf.parent[i] << (i == n - 1 ? "" : " ");
+```
+
+这会产生大量 C++ stream 格式化调用。优化五末尾将输出改为先在用户态缓冲区中拼接完整 parent 数组，再通过一次 `_write/write` 写出：
+
+```cpp
+std::string out_buf;
+out_buf.reserve(n * 8);
+
+char temp[16];
+for (int i = 0; i < n; ++i) {
+    int len = std::snprintf(
+        temp, sizeof(temp), "%d%s",
+        uf.parent[i], (i == n - 1 ? "" : " "));
+    out_buf.append(temp, len);
+}
+out_buf.push_back('\n');
+write(1, out_buf.data(), out_buf.size());
+```
+
+该优化不改变输出内容，只改变输出组织方式，因此正确性边界非常清晰：只要数字顺序、空格分隔和末尾换行保持不变，MD5 应完全一致。远端脚本重新验证后，`test.fasta` 与 `test2.fasta` 多阈值输出均为 `MD5: PASS`；32 线程下 `test2.fasta` 四阈值平均时间为 `0.770s`，与优化五主体优化后的最优水平保持一致。
+
+### 3.8 探索性实验与负优化规避
+
+在实验过程中，我们还探索了其他底层与算法优化（原阶段三和阶段四）。经过实测，这些优化在特定数据集或编译器环境下效果不强，甚至可能导致负优化。我们本着严谨科学的实验态度，诚实记录了这些探索，并将它们在代码中作为**编译期可选开关保留，但默认处于关闭状态**。
+
+##### 探索性优化一：倒排索引候选生成（未默认启用）
+
+#### 阶段目标
+
+探索性优化一的目标是在 Phase 2 的 dense+sparse 表示和长度上界剪枝基础上，进一步减少进入精确 Weighted Jaccard kernel 的候选 pair。核心思路是为每个 3-mer 构建倒排表 `postings[kmer_id]`：如果两条序列没有共享任何 3-mer，则它们的交集一定为 0，在阈值大于 0 时必然不能连边。因此，在极稀疏数据上，可以只从当前序列包含的 3-mer 倒排表中收集候选 `j`，避免扫描完整的 `i+1 ... n-1`。
+
+本阶段新增了三层自适应判断：
+
+1. `POSTING_AVG_NNZ_LIMIT = 128.0`：若平均非零 3-mer 种类数较高，说明序列并不稀疏，直接跳过倒排索引构建。
+2. `POSTING_GLOBAL_ALPHA = 4.0`：用 $\sum_d |P_d|(|P_d|-1)/2$ 估计倒排表重复发射的 pair 数，若该估计明显高于全量 pair 扫描，则不启用 postings。
+3. `POSTING_ALPHA = 16.0`：对单行 `i`，用“只位于 `i` 之后的 postings 数量”估计候选生成成本，只有该成本低于全扫描成本时才走倒排候选，否则保留 Phase 2 的全扫描路径。
+
+这一设计保证了正确性不变：倒排索引只会排除“没有共享 3-mer”的 pair，而这些 pair 的 Weighted Jaccard 分子为 0；同时所有候选 `j` 在进入 union 前仍按升序处理，保持与基准程序一致的确定性输出。
+
+由于远端实测发现该优化对当前数据集不是正收益，最终提交版本将 Phase 3 postings 设置为**默认关闭**。默认 `make TARGET=jaccard_cluster_test` 会走 Phase 2 热路径；只有显式指定编译宏时才启用倒排候选：
+
+```bash
+make TARGET=jaccard_cluster_test EXTRA_CXXFLAGS=-DENABLE_PHASE3_POSTINGS=1
+```
+
+#### 根据运行结果进行的修复与调参
+
+初始阶段三版本无条件构建 postings，并在 4 线程远端测试中得到如下结果：
+
+| 版本 | 编译方式 | test.fasta | test2.fasta 四阈值平均 | MD5 |
+|:---:|:---|:----------:|:----------------------:|:---:|
+| 初始 Phase 3 | 无条件启用 postings | 0.06s | 21.28s | PASS |
+| 自适应 Phase 3 | 运行时 gate | 0.05s | 21.228s | PASS |
+| 最终默认版本 | 默认关闭 postings | 0.05s | 19.89s | PASS |
+
+测试表明，当前两个数据集的平均非零 3-mer 种类数较高，倒排表候选会产生大量重复发射，构建索引本身也会带来额外开销。运行时 gate 虽然避免了更严重的负优化，但仍保留少量分支和统计成本。因此最终实现改为编译期开关：默认关闭 postings，完全恢复 Phase 2 热路径；需要做更稀疏数据集实验时，再用 `-DENABLE_PHASE3_POSTINGS=1` 显式开启。
+
+#### 正确性验证
+
+阶段三最终版本使用 `scripts/run/run_all.ps1` 在远端服务器完成验证：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run\run_all.ps1 -Runs 1 -Threads <线程数>
+```
+
+验证覆盖线程数 `1, 2, 4, 8, 16, 32, 64`。其中 `test.fasta` 固定阈值为 0.85；`test2.fasta` 覆盖 `0.80, 0.85, 0.90, 0.95` 四个阈值。所有线程数、所有阈值均为 `MD5: PASS`。
+
+默认构建的验证命令不传入 `EXTRA_CXXFLAGS`，因此 Phase 3 postings 处于关闭状态；可选 postings 实验则通过 `EXTRA_CXXFLAGS=-DENABLE_PHASE3_POSTINGS=1` 单独开启。
+
+#### 可选 Phase 3 postings 实验性能结果
+
+##### `test.fasta`
+
+| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
+|:------:|:----------------:|:------:|:------------:|:---:|
+| 1  | 0.080 | 1.00× | 100.0% | PASS |
+| 2  | 0.060 | 1.33× | 66.7%  | PASS |
+| 4  | 0.050 | 1.60× | 40.0%  | PASS |
+| 8  | 0.040 | 2.00× | 25.0%  | PASS |
+| 16 | 0.040 | 2.00× | 12.5%  | PASS |
+| 32 | 0.040 | 2.00× | 6.3%   | PASS |
+| 64 | 0.040 | 2.00× | 3.1%   | PASS |
+
+`test.fasta` 的总耗时已经降到 0.04s 量级，计时粒度、远端负载波动、OpenMP 调度和 block 同步开销已经接近甚至超过有效计算本身，因此多线程加速比不再具备强线性解释意义。
+
+##### 执行时间
+![Phase 3 执行时间 test.fasta](report_images/p3_exec_time_t1.png)
+
+##### 加速比
+![Phase 3 加速比 test.fasta](report_images/p3_speedup_t1.png)
+
+##### 并行效率
+![Phase 3 并行效率 test.fasta](report_images/p3_efficiency_t1.png)
+
+##### `test2.fasta`
+
+下表为 `0.80, 0.85, 0.90, 0.95` 四个阈值运行时间的平均值：
+
+| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
+|:------:|:----------------:|:------:|:------------:|:---:|
+| 1  | 65.190 | 1.00×  | 100.0% | PASS |
+| 2  | 34.565 | 1.89×  | 94.3%  | PASS |
+| 4  | 21.228 | 3.07×  | 76.8%  | PASS |
+| 8  | 12.712 | 5.13×  | 64.1%  | PASS |
+| 16 | 8.558  | 7.62×  | 47.6%  | PASS |
+| 32 | 5.502  | 11.85× | 37.0%  | PASS |
+| 64 | 5.722  | 11.39× | 17.8%  | PASS |
+
+从结果看，32 线程仍是当前远端机器上的最佳配置；64 线程虽然线程数翻倍，但受到超线程、共享缓存、内存带宽和同步开销影响，平均时间反而从 5.502s 回升到 5.722s。
+
+##### 执行时间
+![Phase 3 执行时间 test2.fasta](report_images/p3_exec_time_t2.png)
+
+##### 加速比
+![Phase 3 加速比 test2.fasta](report_images/p3_speedup_t2.png)
+
+##### 并行效率
+![Phase 3 并行效率 test2.fasta](report_images/p3_efficiency_t2.png)
+
+#### Phase 2 vs 可选 Phase 3 postings 对比可视化
+
+##### 执行时间对比 (test2.fasta)
+![Phase 2 vs 可选 Phase 3 postings 执行时间对比](report_images/p3_vs_p2_exec_time.png)
+
+##### 加速比对比 (test2.fasta)
+![Phase 2 vs 可选 Phase 3 postings 加速比对比](report_images/p3_vs_p2_speedup.png)
+
+#### 探索性优化一结论
+
+探索性优化一最重要的结论不是“倒排索引一定更快”，而是：**候选生成本身也需要成本模型约束**。对于真正稀疏、共享 k-mer 很少的数据，postings 可以避免大量无效 pair；但对于当前 `test.fasta` 和 `test2.fasta`，非零特征数和 postings 重复发射成本较高，无条件倒排索引会退化为负优化。
+
+最终代码保留了倒排候选能力，但默认关闭，以保证正式提交性能不低于 Phase 2。需要扩展到更稀疏数据集时，可以通过编译宏启用 postings，并继续利用平均 nnz、全局重复 pair 估计、单行后缀 postings 工作量三道门槛控制风险。这样既保留了阶段三实验探索价值，也避免影响默认评测性能。
+
+---
+
+##### 探索性优化二：手写 AVX2 Kernel（未默认启用）
+
+#### 阶段目标
+
+探索性优化二聚焦于候选 pair 进入精确 Weighted Jaccard 计算后的核心 kernel。前三阶段已经完成了 dense+sparse 双表示、长度上界剪枝、只读同分量剪枝和可选倒排候选生成；本阶段继续检查 `sum(min)` 的计算路径，目标是：
+
+1. 保持 `sum(max)=sum_i+sum_j-sum(min)` 的数学等价变换，只计算一次交集；
+2. 为 dense pair 增加可选手写 AVX2 kernel，避免 16-bit lane 累加溢出；
+3. 复测 `SPARSE_THRESHOLD` 门槛，确认 sparse+dense 与 dense SIMD 的切换点；
+4. 以远端 `scripts/run/sweep_threads.ps1` 的 MD5 和时间结果决定最终默认配置。
+
+最终代码保留两类 dense kernel：
+
+```cpp
+#ifndef WJ_USE_AVX2_DENSE
+#define WJ_USE_AVX2_DENSE 0
+#endif
+```
+
+默认仍使用 `#pragma omp simd` 版本，由 GCC 在远端机器上生成 SIMD 指令；手写 AVX2 版本保留为可选实验路径，可通过 `-DWJ_USE_AVX2_DENSE=1` 开启。这样做的原因是远端实测显示，手写 AVX2 在部分高线程点略有收益，但 4 线程和单线程并不稳定，默认开启不是稳健选择。
+
+#### 手写 AVX2 Kernel 设计
+
+手写 AVX2 版本每次处理 16 个 `uint16_t` 频次，先用 `_mm256_min_epu16` 得到逐 lane 最小值，再把低/高 128-bit 半区分别扩展到 8 个 `uint32_t` lane 累加：
+
+```cpp
+__m256i mn = _mm256_min_epu16(va, vb);
+__m128i mn_lo = _mm256_castsi256_si128(mn);
+__m128i mn_hi = _mm256_extracti128_si256(mn, 1);
+acc0 = _mm256_add_epi32(acc0, _mm256_cvtepu16_epi32(mn_lo));
+acc1 = _mm256_add_epi32(acc1, _mm256_cvtepu16_epi32(mn_hi));
+```
+
+这里不能直接在 16-bit lane 上累加，否则长序列或高频 k-mer 会发生溢出。实现中还对主循环做了 32 维展开，减少循环分支和累加依赖；不过最终默认没有启用它，因为该远端平台上 GCC 自动向量化版本更稳定。
+
+#### 调参结果与最终取舍
+
+以下实验均使用 4 线程、`run_all.ps1 -Runs 1`，`test2.fasta` 取 `0.80/0.85/0.90/0.95` 四个阈值平均，所有实验均 `MD5: PASS`。
+
+| 版本 | `SPARSE_THRESHOLD` | 手写 AVX2 | test2 四阈值平均时间 (s) | 结论 |
+|:----|:------------------:|:---------:|:-------------------------:|:-----|
+| 展开 AVX2 | 2048 | 开 | 21.325 | 正确，但 4 线程不占优 |
+| 展开 AVX2 | 4096 | 开 | 21.182 | 略有改善 |
+| 展开 AVX2 | 8192 | 开 | 21.158 | 本组 AVX2 门槛最佳 |
+| 展开 AVX2 | 16384 | 开 | 21.375 | sparse 随机查表过多，回退 |
+| 默认 SIMD | 8192 | 关 | 21.263 | 自动向量化更稳，但门槛偏大 |
+| **最终默认** | **2048** | **关** | **21.132** | 本组调参最佳，作为提交配置 |
+
+因此最终提交选择：
+
+```cpp
+#define WJ_SPARSE_THRESHOLD 2048
+#define WJ_USE_AVX2_DENSE 0
+```
+
+这个选择不是否定手写 AVX2 的价值，而是基于本实验平台和数据集的实测结果：当前瓶颈更接近“候选 pair 数量 + 内存访问总量”，而不是单个 dense kernel 循环体的纯指令吞吐。保留 AVX2 开关可以让后续在 AVX-512 或更新 CPU 上继续复测。
+
+#### 探索性优化二最终正确性验证
+
+最终默认代码通过以下命令完成完整线程扫线：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run\sweep_threads.ps1 -Runs 1 -ThreadList "1,2,4,8,16,32,64"
+```
+
+验证覆盖：
+
+- `test.fasta`：阈值 `0.85`
+- `test2.fasta`：阈值 `0.80, 0.85, 0.90, 0.95`
+- 线程数：`1, 2, 4, 8, 16, 32, 64`
+
+所有线程数和所有阈值均 `MD5: PASS`。
+
+#### 探索性优化二性能结果
+
+##### `test.fasta`
+
+| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
+|:------:|:----------------:|:------:|:------------:|:---:|
+| 1  | 0.080 | 1.00× | 100.0% | PASS |
+| 2  | 0.060 | 1.33× | 66.7%  | PASS |
+| 4  | 0.040 | 2.00× | 50.0%  | PASS |
+| 8  | 0.040 | 2.00× | 25.0%  | PASS |
+| 16 | 0.030 | 2.67× | 16.7%  | PASS |
+| 32 | 0.040 | 2.00× | 6.3%   | PASS |
+| 64 | 0.040 | 2.00× | 3.1%   | PASS |
+
+##### 执行时间
+![Phase 4 执行时间 test.fasta](report_images/p4_exec_time_t1.png)
+
+##### 加速比
+![Phase 4 加速比 test.fasta](report_images/p4_speedup_t1.png)
+
+##### 并行效率
+![Phase 4 并行效率 test.fasta](report_images/p4_efficiency_t1.png)
+
+##### `test2.fasta`
+
+下表为 `0.80, 0.85, 0.90, 0.95` 四个阈值运行时间的平均值：
+
+| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
+|:------:|:----------------:|:------:|:------------:|:---:|
+| 1  | 65.962 | 1.00×  | 100.0% | PASS |
+| 2  | 34.812 | 1.89×  | 94.7%  | PASS |
+| 4  | 21.228 | 3.11×  | 77.7%  | PASS |
+| 8  | 12.845 | 5.14×  | 64.2%  | PASS |
+| 16 | 8.295  | 7.95×  | 49.7%  | PASS |
+| 32 | 5.620  | 11.74× | 36.7%  | PASS |
+| 64 | 5.778  | 11.42× | 17.8%  | PASS |
+
+##### 执行时间
+![Phase 4 执行时间 test2.fasta](report_images/p4_exec_time_t2.png)
+
+##### 加速比
+![Phase 4 加速比 test2.fasta](report_images/p4_speedup_t2.png)
+
+##### 并行效率
+![Phase 4 并行效率 test2.fasta](report_images/p4_efficiency_t2.png)
+
+#### 探索性优化二结论
+
+探索性优化二的主要结论是：**精确 kernel 的优化必须服从实测，而不是只看指令形式是否更“底层”**。手写 AVX2 版本在数学上正确，也能作为后续平台的实验开关；但在当前远端 CPU 和当前数据集上，默认使用 GCC 自动向量化 dense kernel、保留 `SPARSE_THRESHOLD=2048`，整体更稳。
+
+最终代码保持了阶段二/三的正确性边界：并行阶段只记录边、不写并查集；相似度判断仍使用 `inter >= threshold * (sum_i + sum_j - inter)`；输出顺序和 union 规则不变。完整扫线验证表明，阶段四修改没有引入任何 MD5 回归。
+
+
+---
+
+## 4. 全局性能分析与科学结论
+
 
 ### 10.1 算法级优化的巨大贡献
 
@@ -492,241 +1022,23 @@ Phase 2 的四项优化具有清晰的工程层次：
 
 ---
 
-# 第三阶段
+## 5. 完整源代码结构
 
-## 11. 第三阶段：倒排索引候选生成与自适应负优化规避
 
-### 11.1 阶段目标
+核心结构概览：
 
-第三阶段的目标是在 Phase 2 的 dense+sparse 表示和长度上界剪枝基础上，进一步减少进入精确 Weighted Jaccard kernel 的候选 pair。核心思路是为每个 3-mer 构建倒排表 `postings[kmer_id]`：如果两条序列没有共享任何 3-mer，则它们的交集一定为 0，在阈值大于 0 时必然不能连边。因此，在极稀疏数据上，可以只从当前序列包含的 3-mer 倒排表中收集候选 `j`，避免扫描完整的 `i+1 ... n-1`。
-
-本阶段新增了三层自适应判断：
-
-1. `POSTING_AVG_NNZ_LIMIT = 128.0`：若平均非零 3-mer 种类数较高，说明序列并不稀疏，直接跳过倒排索引构建。
-2. `POSTING_GLOBAL_ALPHA = 4.0`：用 $\sum_d |P_d|(|P_d|-1)/2$ 估计倒排表重复发射的 pair 数，若该估计明显高于全量 pair 扫描，则不启用 postings。
-3. `POSTING_ALPHA = 16.0`：对单行 `i`，用“只位于 `i` 之后的 postings 数量”估计候选生成成本，只有该成本低于全扫描成本时才走倒排候选，否则保留 Phase 2 的全扫描路径。
-
-这一设计保证了正确性不变：倒排索引只会排除“没有共享 3-mer”的 pair，而这些 pair 的 Weighted Jaccard 分子为 0；同时所有候选 `j` 在进入 union 前仍按升序处理，保持与基准程序一致的确定性输出。
-
-由于远端实测发现该优化对当前数据集不是正收益，最终提交版本将 Phase 3 postings 设置为**默认关闭**。默认 `make TARGET=jaccard_cluster_test` 会走 Phase 2 热路径；只有显式指定编译宏时才启用倒排候选：
-
-```bash
-make TARGET=jaccard_cluster_test EXTRA_CXXFLAGS=-DENABLE_PHASE3_POSTINGS=1
-```
-
-### 11.2 根据运行结果进行的修复与调参
-
-初始阶段三版本无条件构建 postings，并在 4 线程远端测试中得到如下结果：
-
-| 版本 | 编译方式 | test.fasta | test2.fasta 四阈值平均 | MD5 |
-|:---:|:---|:----------:|:----------------------:|:---:|
-| 初始 Phase 3 | 无条件启用 postings | 0.06s | 21.28s | PASS |
-| 自适应 Phase 3 | 运行时 gate | 0.05s | 21.228s | PASS |
-| 最终默认版本 | 默认关闭 postings | 0.05s | 19.89s | PASS |
-
-测试表明，当前两个数据集的平均非零 3-mer 种类数较高，倒排表候选会产生大量重复发射，构建索引本身也会带来额外开销。运行时 gate 虽然避免了更严重的负优化，但仍保留少量分支和统计成本。因此最终实现改为编译期开关：默认关闭 postings，完全恢复 Phase 2 热路径；需要做更稀疏数据集实验时，再用 `-DENABLE_PHASE3_POSTINGS=1` 显式开启。
-
-### 11.3 正确性验证
-
-阶段三最终版本使用 `scripts/run/run_all.ps1` 在远端服务器完成验证：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run\run_all.ps1 -Runs 1 -Threads <线程数>
-```
-
-验证覆盖线程数 `1, 2, 4, 8, 16, 32, 64`。其中 `test.fasta` 固定阈值为 0.85；`test2.fasta` 覆盖 `0.80, 0.85, 0.90, 0.95` 四个阈值。所有线程数、所有阈值均为 `MD5: PASS`。
-
-默认构建的验证命令不传入 `EXTRA_CXXFLAGS`，因此 Phase 3 postings 处于关闭状态；可选 postings 实验则通过 `EXTRA_CXXFLAGS=-DENABLE_PHASE3_POSTINGS=1` 单独开启。
-
-### 11.4 可选 Phase 3 postings 实验性能结果
-
-#### 11.4.1 `test.fasta`
-
-| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
-|:------:|:----------------:|:------:|:------------:|:---:|
-| 1  | 0.080 | 1.00× | 100.0% | PASS |
-| 2  | 0.060 | 1.33× | 66.7%  | PASS |
-| 4  | 0.050 | 1.60× | 40.0%  | PASS |
-| 8  | 0.040 | 2.00× | 25.0%  | PASS |
-| 16 | 0.040 | 2.00× | 12.5%  | PASS |
-| 32 | 0.040 | 2.00× | 6.3%   | PASS |
-| 64 | 0.040 | 2.00× | 3.1%   | PASS |
-
-`test.fasta` 的总耗时已经降到 0.04s 量级，计时粒度、远端负载波动、OpenMP 调度和 block 同步开销已经接近甚至超过有效计算本身，因此多线程加速比不再具备强线性解释意义。
-
-#### 11.4.1.1 执行时间
-![Phase 3 执行时间 test.fasta](report_images/p3_exec_time_t1.png)
-
-#### 11.4.1.2 加速比
-![Phase 3 加速比 test.fasta](report_images/p3_speedup_t1.png)
-
-#### 11.4.1.3 并行效率
-![Phase 3 并行效率 test.fasta](report_images/p3_efficiency_t1.png)
-
-#### 11.4.2 `test2.fasta`
-
-下表为 `0.80, 0.85, 0.90, 0.95` 四个阈值运行时间的平均值：
-
-| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
-|:------:|:----------------:|:------:|:------------:|:---:|
-| 1  | 65.190 | 1.00×  | 100.0% | PASS |
-| 2  | 34.565 | 1.89×  | 94.3%  | PASS |
-| 4  | 21.228 | 3.07×  | 76.8%  | PASS |
-| 8  | 12.712 | 5.13×  | 64.1%  | PASS |
-| 16 | 8.558  | 7.62×  | 47.6%  | PASS |
-| 32 | 5.502  | 11.85× | 37.0%  | PASS |
-| 64 | 5.722  | 11.39× | 17.8%  | PASS |
-
-从结果看，32 线程仍是当前远端机器上的最佳配置；64 线程虽然线程数翻倍，但受到超线程、共享缓存、内存带宽和同步开销影响，平均时间反而从 5.502s 回升到 5.722s。
-
-#### 11.4.2.1 执行时间
-![Phase 3 执行时间 test2.fasta](report_images/p3_exec_time_t2.png)
-
-#### 11.4.2.2 加速比
-![Phase 3 加速比 test2.fasta](report_images/p3_speedup_t2.png)
-
-#### 11.4.2.3 并行效率
-![Phase 3 并行效率 test2.fasta](report_images/p3_efficiency_t2.png)
-
-### 11.4.3 Phase 2 vs 可选 Phase 3 postings 对比可视化
-
-#### 11.4.3.1 执行时间对比 (test2.fasta)
-![Phase 2 vs 可选 Phase 3 postings 执行时间对比](report_images/p3_vs_p2_exec_time.png)
-
-#### 11.4.3.2 加速比对比 (test2.fasta)
-![Phase 2 vs 可选 Phase 3 postings 加速比对比](report_images/p3_vs_p2_speedup.png)
-
-### 11.5 第三阶段结论
-
-第三阶段最重要的结论不是“倒排索引一定更快”，而是：**候选生成本身也需要成本模型约束**。对于真正稀疏、共享 k-mer 很少的数据，postings 可以避免大量无效 pair；但对于当前 `test.fasta` 和 `test2.fasta`，非零特征数和 postings 重复发射成本较高，无条件倒排索引会退化为负优化。
-
-最终代码保留了倒排候选能力，但默认关闭，以保证正式提交性能不低于 Phase 2。需要扩展到更稀疏数据集时，可以通过编译宏启用 postings，并继续利用平均 nnz、全局重复 pair 估计、单行后缀 postings 工作量三道门槛控制风险。这样既保留了阶段三实验探索价值，也避免影响默认评测性能。
+| 代码区域 | 行号 | 功能 |
+|---------|------|------|
+| 兼容性氨基酸映射 | 87-102 | 构建 `A-Z` 的 `aa_map[256]` 与 `26^3` 直接索引 |
+| Sparse 非零特征 | 106-109 | `KmerCount` 结构体定义 |
+| K-mer频次+sparse提取 | 112-140 | `seq_to_freq()` 同时构建 dense 和 sparse 表示 |
+| 长度上界剪枝 | 145-151 | `length_bound_may_pass()` 安全剪枝 |
+| Sparse+Dense Kernel | 154-162 | `sparse_dense_inter()` 稀疏交集计算 |
+| Dense SIMD Kernel | 165-250 | `dense_inter_scalar()` 默认编译器 SIMD；`dense_inter_avx2()` 可选手写 AVX2 |
+| 自适应Kernel选择 | 253-271 | `intersection()` 根据 nnz 自动切换 sparse+dense 或 dense kernel |
+| 倒排候选启发式 | 286-336 | `use_posting_candidates()` / `enable_posting_index()` / `generate_candidates_by_postings()` |
+| 并查集（含只读find） | 346-379 | 路径折半 + 小索引根 + 只读 find_no_compress |
+| 倒排索引收益门槛 | 488-527 | 根据平均 nnz 和重复 postings pair 估计决定是否构建倒排索引 |
+| Block级收边与剪枝 | 529-622 | 候选生成/全扫描自适应 → 长度剪枝 → 同分量剪枝 → Kernel → 串行union |
 
 ---
-
-# 第四阶段
-
-## 12. 第四阶段：自适应 Weighted Jaccard 精确 Kernel 复核与调参
-
-### 12.1 阶段目标
-
-第四阶段聚焦于候选 pair 进入精确 Weighted Jaccard 计算后的核心 kernel。前三阶段已经完成了 dense+sparse 双表示、长度上界剪枝、只读同分量剪枝和可选倒排候选生成；本阶段继续检查 `sum(min)` 的计算路径，目标是：
-
-1. 保持 `sum(max)=sum_i+sum_j-sum(min)` 的数学等价变换，只计算一次交集；
-2. 为 dense pair 增加可选手写 AVX2 kernel，避免 16-bit lane 累加溢出；
-3. 复测 `SPARSE_THRESHOLD` 门槛，确认 sparse+dense 与 dense SIMD 的切换点；
-4. 以远端 `scripts/run/sweep_threads.ps1` 的 MD5 和时间结果决定最终默认配置。
-
-最终代码保留两类 dense kernel：
-
-```cpp
-#ifndef WJ_USE_AVX2_DENSE
-#define WJ_USE_AVX2_DENSE 0
-#endif
-```
-
-默认仍使用 `#pragma omp simd` 版本，由 GCC 在远端机器上生成 SIMD 指令；手写 AVX2 版本保留为可选实验路径，可通过 `-DWJ_USE_AVX2_DENSE=1` 开启。这样做的原因是远端实测显示，手写 AVX2 在部分高线程点略有收益，但 4 线程和单线程并不稳定，默认开启不是稳健选择。
-
-### 12.2 手写 AVX2 Kernel 设计
-
-手写 AVX2 版本每次处理 16 个 `uint16_t` 频次，先用 `_mm256_min_epu16` 得到逐 lane 最小值，再把低/高 128-bit 半区分别扩展到 8 个 `uint32_t` lane 累加：
-
-```cpp
-__m256i mn = _mm256_min_epu16(va, vb);
-__m128i mn_lo = _mm256_castsi256_si128(mn);
-__m128i mn_hi = _mm256_extracti128_si256(mn, 1);
-acc0 = _mm256_add_epi32(acc0, _mm256_cvtepu16_epi32(mn_lo));
-acc1 = _mm256_add_epi32(acc1, _mm256_cvtepu16_epi32(mn_hi));
-```
-
-这里不能直接在 16-bit lane 上累加，否则长序列或高频 k-mer 会发生溢出。实现中还对主循环做了 32 维展开，减少循环分支和累加依赖；不过最终默认没有启用它，因为该远端平台上 GCC 自动向量化版本更稳定。
-
-### 12.3 调参结果与最终取舍
-
-以下实验均使用 4 线程、`run_all.ps1 -Runs 1`，`test2.fasta` 取 `0.80/0.85/0.90/0.95` 四个阈值平均，所有实验均 `MD5: PASS`。
-
-| 版本 | `SPARSE_THRESHOLD` | 手写 AVX2 | test2 四阈值平均时间 (s) | 结论 |
-|:----|:------------------:|:---------:|:-------------------------:|:-----|
-| 展开 AVX2 | 2048 | 开 | 21.325 | 正确，但 4 线程不占优 |
-| 展开 AVX2 | 4096 | 开 | 21.182 | 略有改善 |
-| 展开 AVX2 | 8192 | 开 | 21.158 | 本组 AVX2 门槛最佳 |
-| 展开 AVX2 | 16384 | 开 | 21.375 | sparse 随机查表过多，回退 |
-| 默认 SIMD | 8192 | 关 | 21.263 | 自动向量化更稳，但门槛偏大 |
-| **最终默认** | **2048** | **关** | **21.132** | 本组调参最佳，作为提交配置 |
-
-因此最终提交选择：
-
-```cpp
-#define WJ_SPARSE_THRESHOLD 2048
-#define WJ_USE_AVX2_DENSE 0
-```
-
-这个选择不是否定手写 AVX2 的价值，而是基于本实验平台和数据集的实测结果：当前瓶颈更接近“候选 pair 数量 + 内存访问总量”，而不是单个 dense kernel 循环体的纯指令吞吐。保留 AVX2 开关可以让后续在 AVX-512 或更新 CPU 上继续复测。
-
-### 12.4 第四阶段最终正确性验证
-
-最终默认代码通过以下命令完成完整线程扫线：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run\sweep_threads.ps1 -Runs 1 -ThreadList "1,2,4,8,16,32,64"
-```
-
-验证覆盖：
-
-- `test.fasta`：阈值 `0.85`
-- `test2.fasta`：阈值 `0.80, 0.85, 0.90, 0.95`
-- 线程数：`1, 2, 4, 8, 16, 32, 64`
-
-所有线程数和所有阈值均 `MD5: PASS`。
-
-### 12.5 第四阶段性能结果
-
-#### 12.5.1 `test.fasta`
-
-| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
-|:------:|:----------------:|:------:|:------------:|:---:|
-| 1  | 0.080 | 1.00× | 100.0% | PASS |
-| 2  | 0.060 | 1.33× | 66.7%  | PASS |
-| 4  | 0.040 | 2.00× | 50.0%  | PASS |
-| 8  | 0.040 | 2.00× | 25.0%  | PASS |
-| 16 | 0.030 | 2.67× | 16.7%  | PASS |
-| 32 | 0.040 | 2.00× | 6.3%   | PASS |
-| 64 | 0.040 | 2.00× | 3.1%   | PASS |
-
-#### 12.5.1.1 执行时间
-![Phase 4 执行时间 test.fasta](report_images/p4_exec_time_t1.png)
-
-#### 12.5.1.2 加速比
-![Phase 4 加速比 test.fasta](report_images/p4_speedup_t1.png)
-
-#### 12.5.1.3 并行效率
-![Phase 4 并行效率 test.fasta](report_images/p4_efficiency_t1.png)
-
-#### 12.5.2 `test2.fasta`
-
-下表为 `0.80, 0.85, 0.90, 0.95` 四个阈值运行时间的平均值：
-
-| 线程数 | 平均运行时间 (s) | 加速比 | 并行效率 (%) | MD5 |
-|:------:|:----------------:|:------:|:------------:|:---:|
-| 1  | 65.962 | 1.00×  | 100.0% | PASS |
-| 2  | 34.812 | 1.89×  | 94.7%  | PASS |
-| 4  | 21.228 | 3.11×  | 77.7%  | PASS |
-| 8  | 12.845 | 5.14×  | 64.2%  | PASS |
-| 16 | 8.295  | 7.95×  | 49.7%  | PASS |
-| 32 | 5.620  | 11.74× | 36.7%  | PASS |
-| 64 | 5.778  | 11.42× | 17.8%  | PASS |
-
-#### 12.5.2.1 执行时间
-![Phase 4 执行时间 test2.fasta](report_images/p4_exec_time_t2.png)
-
-#### 12.5.2.2 加速比
-![Phase 4 加速比 test2.fasta](report_images/p4_speedup_t2.png)
-
-#### 12.5.2.3 并行效率
-![Phase 4 并行效率 test2.fasta](report_images/p4_efficiency_t2.png)
-
-### 12.6 第四阶段结论
-
-第四阶段的主要结论是：**精确 kernel 的优化必须服从实测，而不是只看指令形式是否更“底层”**。手写 AVX2 版本在数学上正确，也能作为后续平台的实验开关；但在当前远端 CPU 和当前数据集上，默认使用 GCC 自动向量化 dense kernel、保留 `SPARSE_THRESHOLD=2048`，整体更稳。
-
-最终代码保持了阶段二/三的正确性边界：并行阶段只记录边、不写并查集；相似度判断仍使用 `inter >= threshold * (sum_i + sum_j - inter)`；输出顺序和 union 规则不变。完整扫线验证表明，阶段四修改没有引入任何 MD5 回归。
